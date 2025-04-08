@@ -1,23 +1,31 @@
 use axum::{
     extract::State, routing::{get, post}, Json, Router
 };
+use futures::{future, stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use std::collections::{HashMap};
+use std::collections::HashMap;
 use reqwest;
+
 
 type replica_id = String;
 type replica_address = String;
 type view_number = u64;
 type op_number = u64;
 type client_id = String;
-type request_id = String;
+type request_number = usize;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Hash)]
 struct ReplicaInfo {
     id: replica_id,
     address: replica_address,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum Operation {
+    Add(usize),
+    Sub(usize),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -28,42 +36,45 @@ enum ReplicaStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct OperationInfo {
+    client_id: String,
+    request_number: request_number,
+    operation: Operation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ViewstampedReplicaState {
     replicas: Vec<ReplicaInfo>,
     replica_number: usize,
     view_number: view_number,
     status: ReplicaStatus,
     op_number: op_number,
-    log: Vec<Operation>,
+    log: Vec<OperationInfo>,
     commit_number: op_number,
-    client_tables: HashMap<client_id, HashMap<request_id, Option<String>>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Operation {
-    client_id: String,
-    request_id: request_id,
-    operation: String,
+    client_tables: HashMap<client_id, Vec<Option<OperationInfo>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ClientRequest {
     client_id: String,
-    request_id: String,
+    request_number: request_number,
     operation: String,
+    value: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PrepareMessage {
     view_number: view_number,
     op_number: op_number,
+    commit_number: op_number,
     request: ClientRequest,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PrepareOkMessage {
-    view_number: u64,
+    view_number: view_number,
     op_number: op_number,
+    commit_number: op_number,
     replica_id: String,
 }
 
@@ -105,6 +116,14 @@ impl ViewstampedReplicaState {
         primary_id == self_id
     }
 
+    fn get_operation_from_string(&self, operation: String, value: usize) -> Operation {
+        match operation.as_str() {
+            "add" => Operation::Add(value),
+            "sub" => Operation::Sub(value),
+            _ => panic!("Invalid operation: {}", operation),
+        }
+    }
+
     async fn handle_client_request(&mut self, request: ClientRequest) -> Result<(), String> {
         // TODO: repass request to primary
         if !self.is_primary() {
@@ -115,19 +134,28 @@ impl ViewstampedReplicaState {
             return Err("Replica not in normal operation".to_string());
         }
 
-        self.op_number += 1;
-        let current_op = self.op_number;
+        if self.client_tables.len() >= request.request_number.clone() {
+            return Err("Request number already exists".to_string());
+        }
 
-        let operation = Operation {
+        if let Some(_) = self.client_tables.get(&request.client_id) {
+            return Ok(());
+        }
+
+        let current_op = self.op_number;
+        self.op_number += 1;
+
+        let operation = OperationInfo {
             client_id: request.client_id.clone(),
-            request_id: request.request_id.clone(),
-            operation: request.operation.clone(),
+            request_number: request.request_number,
+            operation: self.get_operation_from_string(request.operation.clone(), request.value.clone()),
         };
         self.log.push(operation);
 
         let prepare = PrepareMessage {
             view_number: self.view_number,
             op_number: current_op,
+            commit_number: self.commit_number,
             request,
         };
 
@@ -137,10 +165,6 @@ impl ViewstampedReplicaState {
     }
 
     async fn handle_prepare(&mut self, prepare: PrepareMessage) -> Result<(), String> {
-        if self.is_primary() {
-            return Err("Primary should not handle prepare messages".to_string());
-        }
-
         if self.status != ReplicaStatus::Normal {
             return Err("Replica not in normal operation".to_string());
         }
@@ -161,10 +185,11 @@ impl ViewstampedReplicaState {
         }
 
         self.op_number = prepare.op_number;
-        let operation = Operation {
+
+        let operation = OperationInfo {
             client_id: prepare.request.client_id,
-            request_id: prepare.request.request_id,
-            operation: prepare.request.operation,
+            request_number: prepare.request.request_number,
+            operation: self.get_operation_from_string(prepare.request.operation, prepare.request.value),
         };
         self.log.push(operation);
 
@@ -172,122 +197,149 @@ impl ViewstampedReplicaState {
         Ok(())
     }
 
-    async fn handle_prepare_ok(&mut self, msg: PrepareOkMessage) -> Result<(), String> {
-        if !self.is_primary() {
-            return Err("Not the primary".to_string());
-        }
+    // async fn handle_prepare_ok(&mut self, msg: PrepareOkMessage) -> Result<(), String> {
+    //     if !self.is_primary() {
+    //         return Err("Not the primary".to_string());
+    //     }
 
-        if self.status != ReplicaStatus::Normal {
-            return Err("Replica not in normal operation".to_string());
-        }
+    //     if self.status != ReplicaStatus::Normal {
+    //         return Err("Replica not in normal operation".to_string());
+    //     }
 
-        if msg.view_number != self.view_number {
-            return Err("View number mismatch".to_string());
-        }
+    //     if msg.view_number != self.view_number {
+    //         return Err("View number mismatch".to_string());
+    //     }
 
-        if msg.op_number > self.op_number {
-            return Err("Invalid operation number".to_string());
-        }
+    //     if msg.op_number > self.op_number {
+    //         return Err("Invalid operation number".to_string());
+    //     }
 
-        if self.has_prepare_quorum(msg.op_number) {
-            while self.commit_number < msg.op_number {
-                self.commit_number += 1;
-                self.execute_operation(self.commit_number);
-            }
-        }
+    //     if self.has_prepare_quorum(msg.op_number) {
+    //         while self.commit_number < msg.op_number {
+    //             self.commit_number += 1;
+    //             self.execute_operation(self.commit_number);
+    //         }
+    //     }
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 
-    fn has_prepare_quorum(&self, op_number: op_number) -> bool {
-        // Calculate quorum size (f + 1, where f = (n-1)/2)
-        let total_replicas = self.replicas.len();
-        let max_failures = (total_replicas - 1) / 2;
-        let quorum_size = max_failures + 1;
+    // fn has_prepare_quorum(&self, op_number: op_number) -> bool {
+    //     // Calculate quorum size (f + 1, where f = (n-1)/2)
+    //     let total_replicas = self.replicas.len();
+    //     let max_failures = (total_replicas - 1) / 2;
+    //     let quorum_size = max_failures + 1;
 
-        // In a real implementation, you would:
-        // 1. Track prepare-ok messages for each operation
-        // 2. Count unique replicas that have sent prepare-ok
-        // 3. Return true if count >= quorum_size
+    //     // In a real implementation, you would:
+    //     // 1. Track prepare-ok messages for each operation
+    //     // 2. Count unique replicas that have sent prepare-ok
+    //     // 3. Return true if count >= quorum_size
 
-        // For now, returning true to simulate quorum
-        true
-    }
+    //     // For now, returning true to simulate quorum
+    //     true
+    // }
 
-    // Helper method to execute operation
-    fn execute_operation(&mut self, op_number: op_number) {
-        if op_number <= 0 || op_number > self.log.len() as u64 {
-            return;
-        }
+    // // Helper method to execute operation
+    // fn execute_operation(&mut self, op_number: op_number) {
+    //     if op_number <= 0 || op_number > self.log.len() as u64 {
+    //         return;
+    //     }
 
-        // In a real implementation, you would:
-        // 1. Get operation from log
-        // 2. Execute it against your state machine
-        // 3. Update client table with result
-        // 4. Send response to client if this is the primary
-    }
+    //     // In a real implementation, you would:
+    //     // 1. Get operation from log
+    //     // 2. Execute it against your state machine
+    //     // 3. Update client table with result
+    //     // 4. Send response to client if this is the primary
+    // }
 
     async fn broadcast_prepare(&self, prepare: PrepareMessage) {
         let client = reqwest::Client::new();
+        let mut futures = Vec::new();
 
+        // Create futures for all replica requests
         for replica in &self.replicas {
             let prepare_clone = prepare.clone();
-            
-            let replica_addr = format!("{}/prepare", replica.address);
+            let replica_addr = format!("{}{}", replica.address, endpoint);
             let replica_id = replica.id.clone();
-
             let client = client.clone();
 
-            tokio::spawn(async move {
+            let future = async move {
                 match client.post(&replica_addr)
                     .json(&prepare_clone)
                     .send()
                     .await {
                         Ok(response) => {
-                            if !response.status().is_success() {
+                            if response.status().is_success() {
+                                Ok(())
+                            } else {
                                 println!("Failed to send prepare to replica {}: HTTP {}", 
                                     replica_id, response.status());
+                                Err(())
                             }
                         },
                         Err(e) => {
                             println!("Error sending prepare to replica {}: {}", 
                                 replica_id, e);
+                            Err(())
                         }
                     }
-            });
+            };
+            futures.push(future);
         }
-    }
 
-    async fn send_prepare_ok(&self, view_number: view_number, op_number: op_number) {
-        let prepare_ok = PrepareOkMessage {
-            view_number,
-            op_number,
-            replica_id: self.get_self_replica().id.clone(),
-        };
+        let handles = futures.into_iter()
+            .map(|f| tokio::spawn(f))
+            .collect::<Vec<_>>();
 
-        let primary = self.get_primary().clone();
-        let primary_addr = format!("{}/prepare-ok", primary.address);
+        let quorum_size = (self.replicas.len() / 2) + 1;
+        let mut successful_responses = 0;
 
-        let client = reqwest::Client::new();
-        
-        tokio::spawn(async move {
-            match client.post(&primary_addr)
-                .json(&prepare_ok)
-                .send()
-                .await {
-                    Ok(response) => {
-                        if !response.status().is_success() {
-                            println!("Failed to send prepare-ok to primary {}: HTTP {}", 
-                                primary.id, response.status());
-                        }
+        stream::iter(handles)
+            .buffer_unordered(self.replicas.len())
+            .take_while(|result| {
+                match result {
+                    Ok(Ok(())) => {
+                        successful_responses += 1;
+                        future::ready(successful_responses < quorum_size)
                     },
-                    Err(e) => {
-                        println!("Error sending prepare-ok to primary {}: {}", 
-                            primary.id, e);
-                    }
+                    _ => future::ready(true),
                 }
-        });
+            })
+            .collect::<Vec<_>>()
+            .await;
     }
+
+    // async fn send_prepare_ok(&self, view_number: view_number, op_number: op_number) {
+    //     let prepare_ok = PrepareOkMessage {
+    //         view_number,
+    //         op_number,
+    //         commit_number: self.commit_number,
+    //         replica_id: self.get_self_replica().id.clone(),
+    //     };
+
+    //     let primary = self.get_primary().clone();
+    //     let primary_addr = format!("{}/prepare-ok", primary.address);
+
+    //     let client = reqwest::Client::new();
+
+    //     tokio::spawn(async move {
+    //         match client.post(&primary_addr)
+    //             .json(&prepare_ok)
+    //             .send()
+    //             .await {
+    //                 Ok(response) => {
+    //                     if !response.status().is_success() {
+    //                         println!("Failed to send prepare-ok to primary {}: HTTP {}",
+    //                             primary.id, response.status());
+    //                     }
+    //                 },
+    //                 Err(e) => {
+    //                     println!("Error sending prepare-ok to primary {}: {}",
+    //                         primary.id, e);
+    //                 }
+    //             }
+    //     });
+    // }
 }
 
 #[tokio::main]
