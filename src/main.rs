@@ -3,23 +3,23 @@ use axum::{
 };
 use futures::{future, stream, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use std::collections::HashMap;
 use reqwest;
 
 
-type replica_id = String;
-type replica_address = String;
-type view_number = u64;
-type op_number = u64;
-type client_id = String;
-type request_number = usize;
+type ReplicaId = String;
+type ReplicaAddress = String;
+type ViewNumber = u64;
+type OpNumber = u64;
+type ClientId = String;
+type RequestNumber = usize;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Hash)]
 struct ReplicaInfo {
-    id: replica_id,
-    address: replica_address,
+    id: ReplicaId,
+    address: ReplicaAddress,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,7 +38,7 @@ enum ReplicaStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OperationInfo {
     client_id: String,
-    request_number: request_number,
+    request_number: RequestNumber,
     operation: Operation,
 }
 
@@ -46,35 +46,35 @@ struct OperationInfo {
 struct ViewstampedReplicaState {
     replicas: Vec<ReplicaInfo>,
     replica_number: usize,
-    view_number: view_number,
+    view_number: ViewNumber,
     status: ReplicaStatus,
-    op_number: op_number,
+    op_number: OpNumber,
     log: Vec<OperationInfo>,
-    commit_number: op_number,
-    client_tables: HashMap<client_id, Vec<Option<OperationInfo>>>,
+    commit_number: OpNumber,
+    client_tables: HashMap<ClientId, Vec<Option<OperationInfo>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ClientRequest {
     client_id: String,
-    request_number: request_number,
+    request_number: RequestNumber,
     operation: String,
     value: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PrepareMessage {
-    view_number: view_number,
-    op_number: op_number,
-    commit_number: op_number,
+    view_number: ViewNumber,
+    op_number: OpNumber,
+    commit_number: OpNumber,
     request: ClientRequest,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PrepareOkMessage {
-    view_number: view_number,
-    op_number: op_number,
-    commit_number: op_number,
+    view_number: ViewNumber,
+    op_number: OpNumber,
+    commit_number: OpNumber,
     replica_id: String,
 }
 
@@ -104,19 +104,17 @@ impl ViewstampedReplicaState {
     }
 
     fn get_primary(&self) -> &ReplicaInfo {
-        // Primary rotates round-robin as specified in the paper
         let primary_idx = (self.view_number as usize) % self.replicas.len();
         &self.replicas[primary_idx]
     }
 
-    // Check if this replica is the primary
     fn is_primary(&self) -> bool {
         let primary_id = &self.get_primary().id;
         let self_id = &self.get_self_replica().id;
         primary_id == self_id
     }
 
-    fn get_operation_from_string(&self, operation: String, value: usize) -> Operation {
+    fn get_operation_from_payload(&self, operation: String, value: usize) -> Operation {
         match operation.as_str() {
             "add" => Operation::Add(value),
             "sub" => Operation::Sub(value),
@@ -148,7 +146,7 @@ impl ViewstampedReplicaState {
         let operation = OperationInfo {
             client_id: request.client_id.clone(),
             request_number: request.request_number,
-            operation: self.get_operation_from_string(request.operation.clone(), request.value.clone()),
+            operation: self.get_operation_from_payload(request.operation.clone(), request.value.clone()),
         };
         self.log.push(operation);
 
@@ -159,7 +157,10 @@ impl ViewstampedReplicaState {
             request,
         };
 
-        self.broadcast_prepare(prepare).await;
+        let Ok(_) = self.broadcast_till_quorum(prepare, &"/prepare".to_owned()).await
+        else {
+            return Err(String::from("error a"));
+        };
 
         Ok(())
     }
@@ -187,13 +188,24 @@ impl ViewstampedReplicaState {
         self.op_number = prepare.op_number;
 
         let operation = OperationInfo {
-            client_id: prepare.request.client_id,
+            client_id: prepare.request.client_id.clone(),
             request_number: prepare.request.request_number,
-            operation: self.get_operation_from_string(prepare.request.operation, prepare.request.value),
+            operation: self.get_operation_from_payload(prepare.request.operation, prepare.request.value),
         };
-        self.log.push(operation);
 
-        self.send_prepare_ok(self.view_number, self.op_number).await;
+        self.log.push(operation.clone());
+
+        let Some(logs) = self.client_tables.get(&prepare.request.client_id).clone()
+        else { todo!() };
+
+        let mut logs = logs.to_vec();
+
+        logs.push(Some(operation));
+
+        self.client_tables.insert(prepare.request.client_id, logs);
+
+        // self.broadcast_till_quorum(, &"/prepare".to_owned()).await;
+
         Ok(())
     }
 
@@ -252,20 +264,22 @@ impl ViewstampedReplicaState {
     //     // 4. Send response to client if this is the primary
     // }
 
-    async fn broadcast_prepare(&self, prepare: PrepareMessage) {
+    async fn broadcast_till_quorum<M>(&self, message: M, endpoint: &String) -> Result<(), ()>
+    where
+        M: Serialize + Clone + Send + 'static
+    {
         let client = reqwest::Client::new();
         let mut futures = Vec::new();
 
-        // Create futures for all replica requests
         for replica in &self.replicas {
-            let prepare_clone = prepare.clone();
-            let replica_addr = format!("{}{}", replica.address, endpoint);
+            let message = message.clone();
+            let replica_addr = replica.address.clone() + endpoint;
             let replica_id = replica.id.clone();
             let client = client.clone();
 
             let future = async move {
                 match client.post(&replica_addr)
-                    .json(&prepare_clone)
+                    .json(&message)
                     .send()
                     .await {
                         Ok(response) => {
@@ -287,14 +301,14 @@ impl ViewstampedReplicaState {
             futures.push(future);
         }
 
-        let handles = futures.into_iter()
-            .map(|f| tokio::spawn(f))
+        let handlers = futures.into_iter()
+            .map(tokio::spawn)
             .collect::<Vec<_>>();
 
         let quorum_size = (self.replicas.len() / 2) + 1;
         let mut successful_responses = 0;
 
-        stream::iter(handles)
+        stream::iter(handlers)
             .buffer_unordered(self.replicas.len())
             .take_while(|result| {
                 match result {
@@ -307,6 +321,8 @@ impl ViewstampedReplicaState {
             })
             .collect::<Vec<_>>()
             .await;
+
+        Ok(())
     }
 
     // async fn send_prepare_ok(&self, view_number: view_number, op_number: op_number) {
@@ -377,7 +393,7 @@ async fn main() {
     let app = Router::new()
         .route("/request", post(handle_client_request))
         .route("/prepare", post(handle_prepare))
-        .route("/prepare-ok", post(handle_prepare_ok))
+        //.route("/prepare-ok", post(handle_prepare_ok))
         .route("/healthcheck", get(|| async { Json("{\"status\": \"ok\"}") }))
         .with_state(shared_state);
 
@@ -399,8 +415,8 @@ async fn handle_client_request(
     Json(request): Json<ClientRequest>,
 ) -> Json<Result<(), String>> {
     let mut state = state.lock().await;
-    ViewstampedReplicaState::handle_client_request(&mut state, request).await;
-    Json(Ok(()))
+    let handler = ViewstampedReplicaState::handle_client_request(&mut state, request);
+    Json(handler.await)
 }
 
 async fn handle_prepare(
@@ -408,15 +424,15 @@ async fn handle_prepare(
     Json(prepare): Json<PrepareMessage>,
 ) -> Json<Result<(), String>> {
     let mut state = state.lock().await;
-    ViewstampedReplicaState::handle_prepare(&mut state, prepare).await;
-    Json(Ok(()))
+    let handler = ViewstampedReplicaState::handle_prepare(&mut state, prepare);
+    Json(handler.await)
 }
 
-async fn handle_prepare_ok(
-    State(state): State<Arc<Mutex<ViewstampedReplicaState>>>,
-    Json(prepare_ok): Json<PrepareOkMessage>,
-) -> Json<Result<(), String>> {
-    let mut state = state.lock().await;
-    ViewstampedReplicaState::handle_prepare_ok(&mut state, prepare_ok).await;
-    Json(Ok(()))
-}
+// async fn handle_prepare_ok(
+//     State(state): State<Arc<Mutex<ViewstampedReplicaState>>>,
+//     Json(prepare_ok): Json<PrepareOkMessage>,
+// ) -> Json<Result<(), String>> {
+//     let mut state = state.lock().await;
+//     ViewstampedReplicaState::handle_prepare_ok(&mut state, prepare_ok).await;
+//     Json(Ok(()))
+// }
