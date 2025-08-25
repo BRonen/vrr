@@ -157,7 +157,7 @@ impl ViewstampedReplicaState {
             request,
         };
 
-        let Ok(_) = self.broadcast_till_quorum(prepare, &"/prepare".to_owned()).await
+        let Ok(_) = self.broadcast_till_quorum(prepare, "/prepare").await
         else {
             return Err(String::from("error a"));
         };
@@ -204,7 +204,7 @@ impl ViewstampedReplicaState {
 
         self.client_tables.insert(prepare.request.client_id, logs);
 
-        // self.broadcast_till_quorum(, &"/prepare".to_owned()).await;
+        // self.broadcast_till_quorum(, "/prepare").await;
 
         Ok(())
     }
@@ -264,7 +264,7 @@ impl ViewstampedReplicaState {
     //     // 4. Send response to client if this is the primary
     // }
 
-    async fn broadcast_till_quorum<M>(&self, message: M, endpoint: &String) -> Result<(), ()>
+    async fn broadcast_till_quorum<M>(&self, message: M, endpoint: &str) -> Result<(), ()>
     where
         M: Serialize + Clone + Send + 'static
     {
